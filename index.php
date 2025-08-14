@@ -1,11 +1,12 @@
 <?php
 /* =========================================================================
  * Stripe MRR Dashboard — Password Protected + Streaming Preloader
- * Developed by weezly.com
+ * All developed and shared by weezly.com team
  * Login: username = weezly, password = rocks
  * - Session cookie lifetime: 2 months
- * - Settings (gear): set Goal MRR + toggle Show Trials (persist in session)
- * - Streaming pre-loader with logo: sent BEFORE heavy Stripe/FX work
+ * - Settings (gear): set Goal MRR (in dashboard currency) + toggle Show Trials
+ * - Streaming pre-loader with logo (sent BEFORE heavy Stripe/FX work)
+ * - Currency-agnostic output: set $DASH_CURRENCY = 'sek' | 'usd' | 'eur' | ...
  * ========================================================================= */
 
 /////////////////////////////
@@ -13,6 +14,9 @@
 /////////////////////////////
 $AUTH_USER = 'weezly';
 $AUTH_PASS = 'rocks';
+
+// Set your dashboard currency here (lowercase ISO currency code)
+$DASH_CURRENCY = 'sek'; // change to 'usd', 'eur', etc. to switch the whole dashboard
 
 // 2 months cookie lifetime
 $lifetime = 60 * 60 * 24 * 60; // 60 days
@@ -30,7 +34,7 @@ session_start();
 
 // Initialize settings defaults (persisted in session)
 if (!isset($_SESSION['show_trials'])) $_SESSION['show_trials'] = true;
-if (!isset($_SESSION['goal_mrr']))    $_SESSION['goal_mrr']    = 150000.0; // default SEK goal
+if (!isset($_SESSION['goal_mrr']))    $_SESSION['goal_mrr']    = 150000.0; // default goal in DASH currency
 
 // Quick helpers for reading settings
 $SHOW_TRIALS = (bool)($_SESSION['show_trials'] ?? true);
@@ -72,7 +76,7 @@ if (!empty($_SESSION['logged_in']) && $_SERVER['REQUEST_METHOD'] === 'POST' && (
     $val = preg_replace('/[^\d\.\,]/', '', (string)$_POST['goal_mrr']);
     $val = str_replace(',', '.', $val);
     $num = (float)$val;
-    $_SESSION['goal_mrr'] = max(0.0, $num);
+    $_SESSION['goal_mrr'] = max(0.0, $num); // stored in DASH currency
   }
   header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
   exit;
@@ -84,7 +88,7 @@ if (empty($_SESSION['logged_in'])): ?>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>MRR Dashboard</title>
+<title>Login • MRR Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root {--bg:#0b1220;--card:#0f172a;--muted:#94a3b8;--text:#e2e8f0;--accent:#22d3ee;--radius:16px;}
@@ -150,22 +154,20 @@ echo '<!doctype html><html lang="sv"><head><meta charset="utf-8" />'
    . '<img class="loader-logo" src="https://weezly.com/wp-content/uploads/2025/07/weezly_logo_white_new_new.png" alt="Weezly logo" />'
    . '<div class="spinner"></div><div class="loader-text">Loading dashboard…</div>'
    . '</div></div>';
-// send enough bytes to trigger chunked transfer on some hosts
 echo str_repeat(" ", 4096);
 @flush();
 
 /* ================== HEAVY WORK HAPPENS NOW (Stripe/FX) ================== */
 
-$STRIPE_API_KEY = 'sk_live_code'; // <-- your full LIVE key
-$DASH_CURRENCY  = 'sek'; // <-- set your currency here
+$STRIPE_API_KEY = 'sk_live_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'; // <-- your full LIVE key
 
-// ---------- FX fetching with cache ----------
+// ---------- FX helpers (currency-agnostic to $DASH_CURRENCY) ----------
 function fx_fetch_json($url, $timeout = 2){
   $ch = curl_init($url);
   curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_TIMEOUT        => $timeout,
-    CURLOPT_USERAGENT      => 'mrr-dashboard/1.5'
+    CURLOPT_USERAGENT      => 'mrr-dashboard/1.6'
   ]);
   $resp = curl_exec($ch);
   $err  = curl_error($ch);
@@ -176,34 +178,94 @@ function fx_fetch_json($url, $timeout = 2){
   if (!is_array($json)) return [null, 'Invalid JSON'];
   return [$json, null];
 }
-function fx_get_usd_eur_to_sek(&$fx_source_note){
-  $cache_file = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'mrr_fx_cache.json';
+
+/**
+ * Build/extend a rate map that converts FROM src currency TO target currency.
+ * Returns [$fxMap, $note] where $fxMap is ['usd'=>rateToTarget, 'eur'=>..., $target=>1.0, ...]
+ * We prefetch USD & EUR; any other src is fetched on demand and cached (≤6h).
+ */
+function fx_build_map_to_target($target, $existingMap = null){
+  $t = strtolower($target);
+  $fx_source_note = 'fallback (hardcoded)'; // overwritten if live/cache used
+  $cache_file = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'mrr_fx_cache_'.$t.'.json';
   $cache_ttl  = 6 * 3600;
   $now        = time();
-  $usd = null; $eur = null;
 
-  list($j1,) = fx_fetch_json('https://api.frankfurter.app/latest?from=USD&to=SEK', 2);
-  if ($j1 && isset($j1['rates']['SEK'])) $usd = (float)$j1['rates']['SEK'];
-  list($j2,) = fx_fetch_json('https://api.frankfurter.app/latest?from=EUR&to=SEK', 2);
-  if ($j2 && isset($j2['rates']['SEK'])) $eur = (float)$j2['rates']['SEK'];
+  $map = is_array($existingMap) ? $existingMap : [];
+  $map[$t] = 1.0;
 
-  if ($usd && $eur) {
+  // Try live (Frankfurter) for USD and EUR
+  $okAny = false;
+  if (!isset($map['usd'])) {
+    list($j1,) = fx_fetch_json('https://api.frankfurter.app/latest?from=USD&to='.strtoupper($t), 2);
+    if ($j1 && isset($j1['rates'][strtoupper($t)])) { $map['usd'] = (float)$j1['rates'][strtoupper($t)]; $okAny = true; }
+  } else { $okAny = true; }
+  if (!isset($map['eur'])) {
+    list($j2,) = fx_fetch_json('https://api.frankfurter.app/latest?from=EUR&to='.strtoupper($t), 2);
+    if ($j2 && isset($j2['rates'][strtoupper($t)])) { $map['eur'] = (float)$j2['rates'][strtoupper($t)]; $okAny = true; }
+  } else { $okAny = true; }
+
+  if ($okAny) {
     $fx_source_note = 'live: frankfurter.app';
-    @file_put_contents($cache_file, json_encode(['ts'=>$now,'usd'=>$usd,'eur'=>$eur]));
-    return ['sek'=>1.0, 'usd'=>$usd, 'eur'=>$eur];
+    @file_put_contents($cache_file, json_encode(['ts'=>$now,'map'=>$map]));
+    return [$map, $fx_source_note];
   }
 
+  // Cache fallback
   if (is_file($cache_file)) {
     $raw = @file_get_contents($cache_file);
     $data = $raw ? json_decode($raw, true) : null;
-    if (is_array($data) && isset($data['ts'],$data['usd'],$data['eur']) && ($now - (int)$data['ts']) <= $cache_ttl) {
+    if (is_array($data) && isset($data['ts'],$data['map']) && ($now - (int)$data['ts']) <= $cache_ttl) {
       $fx_source_note = 'cache (≤6h)';
-      return ['sek'=>1.0, 'usd'=>(float)$data['usd'], 'eur'=>(float)$data['eur']];
+      $map = (array)$data['map'];
+      $map[$t] = 1.0;
+      return [$map, $fx_source_note];
     }
   }
 
+  // Hardcoded sane defaults (used only if everything fails)
   $fx_source_note = 'fallback (hardcoded)';
-  return ['sek'=>1.0, 'usd'=>11.20, 'eur'=>11.80];
+  // Set rough guesses only for USD/EUR -> target, if not present
+  if (!isset($map['usd'])) $map['usd'] = ($t==='sek') ? 11.20 : 1.00; // 1 USD ≈ 11.2 SEK (example)
+  if (!isset($map['eur'])) $map['eur'] = ($t==='sek') ? 11.80 : 1.10; // 1 EUR ≈ 11.8 SEK (example)
+  $map[$t] = 1.0;
+  return [$map, $fx_source_note];
+}
+
+/**
+ * Ensure we have a rate for $src -> $target in $fxMap; will fetch & cache if missing.
+ */
+function fx_ensure_rate(&$fxMap, $src, $target){
+  $s = strtolower($src); $t = strtolower($target);
+  if ($s === $t) { $fxMap[$t] = 1.0; return; }
+  if (isset($fxMap[$s]) && $fxMap[$s] > 0) return;
+
+  // Try live (Frankfurter), then exchangerate.host, then store in cache
+  $cache_file = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'mrr_fx_cache_'.$t.'.json';
+  list($j1,) = fx_fetch_json('https://api.frankfurter.app/latest?from='.strtoupper($s).'&to='.strtoupper($t), 2);
+  if ($j1 && isset($j1['rates'][strtoupper($t)])) {
+    $fxMap[$s] = (float)$j1['rates'][strtoupper($t)];
+    @file_put_contents($cache_file, json_encode(['ts'=>time(),'map'=>$fxMap]));
+    return;
+  }
+  list($j2,) = fx_fetch_json('https://api.exchangerate.host/latest?base='.strtoupper($s).'&symbols='.strtoupper($t), 2);
+  if ($j2 && isset($j2['rates'][strtoupper($t)])) {
+    $fxMap[$s] = (float)$j2['rates'][strtoupper($t)];
+    @file_put_contents($cache_file, json_encode(['ts'=>time(),'map'=>$fxMap]));
+    return;
+  }
+  // As a last resort, set 0 (so amount becomes 0 instead of crashing)
+  $fxMap[$s] = 0.0;
+}
+
+/** Convert major units from $src to $target using $fxMap (auto-fetch if needed). */
+function to_target_currency($amountMajor, $srcCurrencyLower, &$fxMap, $target){
+  $src = strtolower($srcCurrencyLower);
+  $tgt = strtolower($target);
+  if ($src === $tgt) return $amountMajor;
+  fx_ensure_rate($fxMap, $src, $tgt);
+  $rate = $fxMap[$src] ?? 0.0;
+  return $rate > 0 ? $amountMajor * $rate : 0.0;
 }
 
 // ---------- Stripe + compute helpers ----------
@@ -303,12 +365,10 @@ function item_monthly_major_native($item){
   $cur = strtolower($price['currency'] ?? 'usd');
   return $minor / pow(10, decimals_for($cur));
 }
-function to_sek($amountMajor, $currencyLower, $fxMap){
-  $rate = $fxMap[strtolower($currencyLower)] ?? 0.0;
-  return $rate > 0 ? $amountMajor * $rate : 0.0;
-}
-function compute_current_mrr_sek($fxMap){
-  $totalSEK = 0.0; $starting_after = null;
+
+// ---------- Currency-aware compute ----------
+function compute_current_mrr_target(&$fxMap, $target){
+  $total = 0.0; $starting_after = null;
   do {
     $params = ['status'=>'all','limit'=>100];
     $expands=['data.items.data.price'];
@@ -322,14 +382,14 @@ function compute_current_mrr_sek($fxMap){
         if (!isset($price['recurring'])) continue;
         $nativeMajor = item_monthly_major_native($item);
         $cur = strtolower($price['currency'] ?? 'usd');
-        $totalSEK += to_sek($nativeMajor, $cur, $fxMap);
+        $total += to_target_currency($nativeMajor, $cur, $fxMap, $target);
       }
     }
     $starting_after = !empty($resp['has_more']) ? ($subs ? end($subs)['id'] : null) : null;
   } while ($starting_after);
-  return $totalSEK;
+  return $total;
 }
-function fetch_trialing_rows($fxMap){
+function fetch_trialing_rows_target(&$fxMap, $target){
   $rows = []; $starting_after = null;
   do {
     $params=['status'=>'trialing','limit'=>100];
@@ -342,58 +402,65 @@ function fetch_trialing_rows($fxMap){
       $name = is_array($cust) ? ($cust['name'] ?? '') : '';
       $email= is_array($cust) ? ($cust['email'] ?? '') : '';
       $trialEndISO = isset($sub['trial_end']) && $sub['trial_end'] ? gmdate('Y-m-d',$sub['trial_end']) : '—';
-      $sumSEK = 0.0;
+      $sum = 0.0;
       foreach (($sub['items']['data'] ?? []) as $item) {
         $price = $item['price'] ?? [];
         if (!isset($price['recurring'])) continue;
         $nativeMajor = item_monthly_major_native($item);
         $cur = strtolower($price['currency'] ?? 'usd');
-        $sumSEK += to_sek($nativeMajor, $cur, $fxMap);
+        $sum += to_target_currency($nativeMajor, $cur, $fxMap, $target);
       }
       $rows[] = [
         'customer' => $name ?: ($email ?: '—'),
         'email'    => $email ?: '—',
         'trial_end'=> $trialEndISO,
-        'mrr_sek'  => $sumSEK,
+        'mrr'      => $sum,
       ];
     }
     $starting_after = !empty($resp['has_more']) ? ($subs ? end($subs)['id'] : null) : null;
   } while ($starting_after);
   return $rows;
 }
-function fmt_money($amountMajor, $currency='SEK'){
-  if (class_exists('NumberFormatter')) { $fmt=numfmt_create('sv_SE', NumberFormatter::CURRENCY); return numfmt_format_currency($fmt,$amountMajor,strtoupper($currency)); }
+function fmt_money($amountMajor, $currency='USD'){
+  if (class_exists('NumberFormatter')) {
+    // Map a few common locales by currency for nicer symbols/formatting
+    $locale = 'en_US';
+    $c = strtoupper($currency);
+    if ($c === 'SEK') $locale = 'sv_SE';
+    elseif ($c === 'EUR') $locale = 'de_DE';
+    elseif ($c === 'GBP') $locale = 'en_GB';
+    $fmt = numfmt_create($locale, NumberFormatter::CURRENCY);
+    return numfmt_format_currency($fmt,$amountMajor,$c);
+  }
   return strtoupper($currency).' '.number_format($amountMajor,2,'.',',');
 }
 
 // ---------- MAIN COMPUTE ----------
-$FX_SOURCE = '';
-$FX = fx_get_usd_eur_to_sek($FX_SOURCE);
+list($FX, $FX_SOURCE) = fx_build_map_to_target($DASH_CURRENCY);
+
 $MODE = key_mode($STRIPE_API_KEY);
 $MASK = mask_key($STRIPE_API_KEY);
 
 $acct = stripe_get('account');
 $acct_id = $acct['id'] ?? 'unknown';
 
-$current_mrr_sek = compute_current_mrr_sek($FX);
-$current_arr_sek = $current_mrr_sek * 12;
+$current_mrr = compute_current_mrr_target($FX, $DASH_CURRENCY);
+$current_arr = $current_mrr * 12;
 
 if ($SHOW_TRIALS) {
-  $trial_rows      = fetch_trialing_rows($FX);
-  $trial_total_sek = array_sum(array_map(function($r){ return $r['mrr_sek']; }, $trial_rows));
+  $trial_rows  = fetch_trialing_rows_target($FX, $DASH_CURRENCY);
+  $trial_total = array_sum(array_map(function($r){ return $r['mrr']; }, $trial_rows));
 } else {
   $trial_rows = [];
-  $trial_total_sek = 0.0;
+  $trial_total = 0.0;
 }
 
-$left_to_goal            = max(0.0, $_SESSION['goal_mrr'] - $current_mrr_sek);
-$potential_mrr_sek       = $current_mrr_sek + $trial_total_sek;
-$potential_arr_sek       = $potential_mrr_sek * 12;
-$potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
+$left_to_goal           = max(0.0, $GOAL_MRR - $current_mrr);
+$potential_mrr          = $current_mrr + $trial_total;
+$potential_arr          = $potential_mrr * 12;
+$potential_left_to_goal = max(0.0, $left_to_goal - $trial_total);
 
 /* ================== OUTPUT THE REAL PAGE, REMOVE PRELOADER ================== */
-
-// Full page styles and markup
 ?>
 <style>
   :root {--bg:#0b1220;--card:#0f172a;--muted:#94a3b8;--text:#e2e8f0;--accent:#22d3ee;--accent-2:#34d399;--danger:#f87171;--shadow:0 10px 30px rgba(0,0,0,.25);--radius:16px;}
@@ -419,29 +486,6 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
   table{width:100%;border-collapse:collapse;font-size:14px;border:1px solid rgba(255,255,255,.08);border-radius:12px;overflow:hidden}
   .tablewrap{overflow:auto;-webkit-overflow-scrolling:touch}
   thead{background:rgba(148,163,184,.08)}th,td{padding:10px 8px;text-align:left;vertical-align:top}tbody tr{border-top:1px solid rgba(255,255,255,.06)}tbody tr:hover{background:rgba(255,255,255,.03)}
-  /* Modal */
-  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
-  .modal{width:min(520px,96vw);background:#0f172a;border:1px solid rgba(255,255,255,.12);border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.5);padding:16px}
-  .modal h3{margin:0 0 8px;color:#e2e8f0;font-size:18px}
-  .modal .row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid rgba(255,255,255,.06)}
-  .modal .row:first-of-type{border-top:none}
-  .switch{position:relative;display:inline-block;width:48px;height:28px}
-  .switch input{display:none}
-  .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#6b7280;border-radius:999px;transition:.2s}
-  .slider:before{position:absolute;content:"";height:22px;width:22px;left:3px;top:3px;background:white;border-radius:50%;transition:.2s}
-  input:checked + .slider{background:#34d399}
-  input:checked + .slider:before{transform:translateX(20px)}
-  .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
-  .btn{padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#fff;cursor:pointer}
-  .btn.primary{background:#22d3ee;color:#0b1220;border-color:transparent;font-weight:800}
-  .field{display:flex;align-items:center;gap:10px}
-  .field input[type="number"]{width:160px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0f172a;color:#e2e8f0}
-  @media (max-width: 560px){
-    .kpi .value{font-size:18px}
-    .actions .logout{padding:8px 10px}
-    .iconbtn{height:34px;width:34px}
-    .field input[type="number"]{width:140px}
-  }
 </style>
 
 <div class="grid">
@@ -463,53 +507,53 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
       </div>
     </div>
 
-    <div class="title"><h2>Overview</h2><span class="pill">SEK</span></div>
+    <div class="title"><h2>Overview</h2><span class="pill"><?= strtoupper($DASH_CURRENCY) ?></span></div>
     <div class="kpis">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div class="kpi">
           <small>Current MRR</small>
-          <div class="value accent"><?= fmt_money($current_mrr_sek,'SEK'); ?></div>
+          <div class="value accent"><?= fmt_money($current_mrr, $DASH_CURRENCY); ?></div>
         </div>
         <div class="kpi">
           <small>Current ARR</small>
-          <div class="value accent"><?= fmt_money($current_arr_sek,'SEK'); ?></div>
+          <div class="value accent"><?= fmt_money($current_arr, $DASH_CURRENCY); ?></div>
         </div>
       </div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div class="kpi">
           <small>Goal MRR</small>
-          <div class="value success"><?= fmt_money($GOAL_MRR,'SEK'); ?></div>
+          <div class="value success"><?= fmt_money($GOAL_MRR, $DASH_CURRENCY); ?></div>
         </div>
         <div class="kpi">
           <small>Left to Earn MRR</small>
-          <div class="value <?= $left_to_goal<=0?'success':'warn'; ?>"><?= fmt_money($left_to_goal,'SEK'); ?></div>
+          <div class="value <?= $left_to_goal<=0?'success':'warn'; ?>"><?= fmt_money($left_to_goal, $DASH_CURRENCY); ?></div>
         </div>
       </div>
 
       <?php if ($SHOW_TRIALS): ?>
       <div class="kpi">
-        <small>Trials (MRR, FX→SEK)</small>
-        <div class="value"><?= fmt_money($trial_total_sek,'SEK'); ?></div>
+        <small>Trials (MRR, FX→<?= strtoupper($DASH_CURRENCY) ?>)</small>
+        <div class="value"><?= fmt_money($trial_total, $DASH_CURRENCY); ?></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
         <div class="kpi">
           <small>Potential MRR</small>
-          <div class="value"><?= fmt_money($potential_mrr_sek,'SEK'); ?></div>
+          <div class="value"><?= fmt_money($potential_mrr, $DASH_CURRENCY); ?></div>
         </div>
         <div class="kpi">
           <small>Potential ARR</small>
-          <div class="value"><?= fmt_money($potential_arr_sek,'SEK'); ?></div>
+          <div class="value"><?= fmt_money($potential_arr, $DASH_CURRENCY); ?></div>
         </div>
         <div class="kpi">
           <small>Potential Left to Earn</small>
-          <div class="value <?= $potential_left_to_goal<=0?'success':'warn'; ?>"><?= fmt_money($potential_left_to_goal,'SEK'); ?></div>
+          <div class="value <?= $potential_left_to_goal<=0?'success':'warn'; ?>"><?= fmt_money($potential_left_to_goal, $DASH_CURRENCY); ?></div>
         </div>
       </div>
       <?php endif; ?>
     </div>
 
-    <div style="margin-top:10px;color:#94a3b8;font-size:12px;">Account: <strong><?= htmlspecialchars($acct_id); ?></strong></div>
+    <div style="margin-top:10px;color:#94a3b8;font-size:12px;">Account: <strong><?= htmlspecialchars($acct_id); ?></strong> • FX source: <strong><?= htmlspecialchars($FX_SOURCE); ?></strong></div>
   </section>
 
   <?php if ($SHOW_TRIALS): ?>
@@ -519,7 +563,7 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
     <div class="tablewrap">
       <table>
         <thead>
-          <tr><th>Customer</th><th>Email</th><th>Trial ends</th><th style="text-align:right;">Est. MRR (SEK)</th></tr>
+          <tr><th>Customer</th><th>Email</th><th>Trial ends</th><th style="text-align:right;">Est. MRR (<?= strtoupper($DASH_CURRENCY) ?>)</th></tr>
         </thead>
         <tbody>
         <?php if (!$trial_rows): ?>
@@ -529,7 +573,7 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
             <td><?= htmlspecialchars($r['customer']); ?></td>
             <td><?= htmlspecialchars($r['email']); ?></td>
             <td><?= htmlspecialchars($r['trial_end']); ?></td>
-            <td style="text-align:right;"><?= fmt_money($r['mrr_sek'],'SEK'); ?></td>
+            <td style="text-align:right;"><?= fmt_money($r['mrr'], $DASH_CURRENCY); ?></td>
           </tr>
         <?php endforeach; endif; ?>
         </tbody>
@@ -540,34 +584,34 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
 </div>
 
 <!-- Settings Modal -->
-<div class="modal-backdrop" id="settingsModal" aria-hidden="true">
-  <form class="modal" method="post" action="">
+<div class="modal-backdrop" id="settingsModal" aria-hidden="true" style="position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px;z-index:50">
+  <form class="modal" method="post" action="" style="width:min(520px,96vw);background:#0f172a;border:1px solid rgba(255,255,255,.12);border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.5);padding:16px">
     <input type="hidden" name="action" value="save_settings" />
-    <h3>Settings</h3>
+    <h3 style="margin:0 0 8px;color:#e2e8f0;font-size:18px">Settings</h3>
 
-    <div class="row">
-      <div class="field">
-        <div style="font-weight:700;">Goal MRR (SEK)</div>
+    <div class="row" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid rgba(255,255,255,.06)">
+      <div class="field" style="display:flex;align-items:center;gap:10px">
+        <div style="font-weight:700;">Goal MRR (<?= strtoupper($DASH_CURRENCY) ?>)</div>
       </div>
-      <div class="field">
-        <input type="number" name="goal_mrr" step="1" min="0" value="<?= htmlspecialchars((string)$GOAL_MRR); ?>" />
+      <div class="field" style="display:flex;align-items:center;gap:10px">
+        <input type="number" name="goal_mrr" step="1" min="0" value="<?= htmlspecialchars((string)$GOAL_MRR); ?>" style="width:160px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0f172a;color:#e2e8f0" />
       </div>
     </div>
 
-    <div class="row">
+    <div class="row" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-top:1px solid rgba(255,255,255,.06)">
       <div>
         <div style="font-weight:700;">Show trialing subscriptions</div>
         <div style="color:#94a3b8;font-size:13px">Toggle the trials panel and related KPIs.</div>
       </div>
-      <label class="switch" title="Show trials">
-        <input type="checkbox" name="show_trials" value="1" <?= $SHOW_TRIALS ? 'checked' : ''; ?> />
-        <span class="slider"></span>
+      <label class="switch" title="Show trials" style="position:relative;display:inline-block;width:48px;height:28px">
+        <input type="checkbox" name="show_trials" value="1" <?= $SHOW_TRIALS ? 'checked' : ''; ?> style="display:none" />
+        <span class="slider" style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#6b7280;border-radius:999px;transition:.2s"></span>
       </label>
     </div>
 
-    <div class="modal-actions">
-      <button type="button" class="btn" id="cancelSettings">Cancel</button>
-      <button type="submit" class="btn primary">Save</button>
+    <div class="modal-actions" style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+      <button type="button" class="btn" id="cancelSettings" style="padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#fff;cursor:pointer">Cancel</button>
+      <button type="submit" class="btn primary" style="padding:10px 14px;border-radius:10px;background:#22d3ee;color:#0b1220;border-color:transparent;font-weight:800;cursor:pointer">Save</button>
     </div>
   </form>
 </div>
@@ -588,8 +632,49 @@ $potential_left_to_goal  = max(0.0, $left_to_goal - $trial_total_sek);
   cancelBtn?.addEventListener('click', closeModal);
   modal?.addEventListener('click', (e)=>{ if(e.target===modal) closeModal(); });
 
-  // ESC to close
-  document.addEventListener('keydown', (e)=>{ if(e.key==='Escape' && modal.getAttribute('aria-hidden')==='false') closeModal(); });
+  // Toggle switch styling (pure CSS requires sibling, we polyfill)
+  const switchLabel = modal.querySelector('.switch');
+  const slider = switchLabel.querySelector('.slider');
+  const checkbox = switchLabel.querySelector('input[type="checkbox"]');
+  function renderSwitch(){
+    if (checkbox.checked) {
+      slider.style.background = '#34d399';
+      slider.style.setProperty('--x','20px');
+      slider.style.setProperty('box-shadow','none');
+      slider.style.transition = '.2s';
+      slider.style.position = 'absolute';
+      slider.style.borderRadius = '999px';
+      slider.style.setProperty('--knob-left','23px');
+      slider.innerHTML = '';
+      slider.style.setProperty('content','""');
+      slider.style.setProperty('display','block');
+    } else {
+      slider.style.background = '#6b7280';
+    }
+    slider.style.setProperty('position','absolute');
+  }
+  // draw knob
+  slider.style.setProperty('position','absolute');
+  const knob = document.createElement('span');
+  knob.style.position = 'absolute';
+  knob.style.height = '22px';
+  knob.style.width = '22px';
+  knob.style.left = '3px';
+  knob.style.top = '3px';
+  knob.style.borderRadius = '50%';
+  knob.style.background = '#fff';
+  knob.style.transition = '.2s';
+  slider.appendChild(knob);
+
+  function updateKnob(){
+    knob.style.transform = checkbox.checked ? 'translateX(20px)' : 'translateX(0)';
+    slider.style.background = checkbox.checked ? '#34d399' : '#6b7280';
+  }
+  switchLabel.addEventListener('click', (e)=> {
+    if (e.target !== checkbox) checkbox.checked = !checkbox.checked;
+    updateKnob();
+  });
+  updateKnob();
 </script>
 
 </body></html>
