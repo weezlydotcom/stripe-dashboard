@@ -22,23 +22,23 @@ Set your MRR goal in settings & disable enable trial subscriptions
 
 ```bash
 # Step 1 — Clone the project
-git clone https://github.com/username/repo.git
+git clone https://github.com/weezlydotcom/stripe-dashboard.git
 ```
 
 ```php
-// Step 2 — Change the username and password (LINE 13 & 14)
+// Step 2 — Change the username and password (LINE 14 & 15)
 $AUTH_USER = 'weezly'; // set your dashboard username
 $AUTH_PASS = 'rocks';  // set your dashboard password
 ```
 
 ```php
-// Step 3 — Set your LIVE Stripe key (LINE 158)
-$STRIPE_API_KEY = 'sk_live_'; // set your stripe key here
+// Step 4 — Set your currency (LINE 19)
+$DASH_CURRENCY = 'sek'; // change this to the currency you want
 ```
 
 ```php
-// Step 4 — Set your currency
-$DASH_CURRENCY = 'sek'; // change this to the currency you want
+// Step 5 — Set your LIVE Stripe key (LINE 162)
+$STRIPE_API_KEY = 'sk_live_'; // set your stripe key here
 ```
 
 ```text
